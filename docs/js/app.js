@@ -3,19 +3,20 @@ const WIN_RESERVED = new Set(['CON','PRN','AUX','NUL','COM0','COM1','COM2','COM3
 function safeFilename(tlc) { return WIN_RESERVED.has(tlc.toUpperCase()) ? `_${tlc}` : tlc; }
 
 let map, stationLayer, odLayer;
-let stations = {};      // { TLC: { n, la, lo } }
+let stations = {};       // { TLC: { n, la, lo } }
 let stationMarkers = {}; // { TLC: L.circleMarker }
-let tlcByName = {};     // { "Station Name": TLC }
+let tlcByName = {};      // { "Station Name": TLC }
 let selectedOrigin = null;
-let currentPairs = [];  // [[dest_tlc, journeys], ...] sorted desc
-let minJourneys = 1;
+let currentPairs = [];   // [[dest_tlc, journeys], ...] sorted desc
+let displayLimit = 15;   // number of top destinations to show; Infinity = all
+let destFilter = null;   // TLC string when filtering to a single destination, else null
+const odCache = {};      // { TLC: pairs[] } — avoids re-fetching OD files
 
 const STATION_STYLE = { radius: 3, fillColor: '#607d8b', color: '#37474f', weight: 0.5, fillOpacity: 0.8 };
 const ORIGIN_STYLE  = { radius: 8, fillColor: '#fdd835', color: '#fff', weight: 1.5, fillOpacity: 1 };
 
-// --- colour ramp: blue → cyan → orange → red (log-scaled journey count) ---
+// --- colour ramp: blue → cyan → orange → red (log-scaled) ---
 function journeyColor(ratio) {
-    // 0 → #4fc3f7 (light blue), 1 → #e53935 (red) via orange
     const stops = [
         [0,   79, 195, 247],
         [0.5, 79, 195, 247],
@@ -27,24 +28,31 @@ function journeyColor(ratio) {
         if (ratio >= stops[i][0] && ratio <= stops[i + 1][0]) { lo = stops[i]; hi = stops[i + 1]; break; }
     }
     const t = lo[0] === hi[0] ? 0 : (ratio - lo[0]) / (hi[0] - lo[0]);
-    const r = Math.round(lo[1] + t * (hi[1] - lo[1]));
-    const g = Math.round(lo[2] + t * (hi[2] - lo[2]));
-    const b = Math.round(lo[3] + t * (hi[3] - lo[3]));
-    return `rgb(${r},${g},${b})`;
+    return `rgb(${Math.round(lo[1]+t*(hi[1]-lo[1]))},${Math.round(lo[2]+t*(hi[2]-lo[2]))},${Math.round(lo[3]+t*(hi[3]-lo[3]))})`;
 }
 
 function logRatio(journeys, logMax) {
     return logMax > 0 ? Math.log10(journeys + 1) / logMax : 0;
 }
 
-// --- map init ---
+// --- map init with selectable base layers ---
 function initMap() {
-    map = L.map('map', { zoomControl: false }).setView([54.5, -2.5], 6);
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}{r}.png', {
+    const dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}{r}.png', {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
         maxZoom: 19,
-    }).addTo(map);
+    });
+    const light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+        maxZoom: 19,
+    });
+    const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+        maxZoom: 19,
+    });
+
+    map = L.map('map', { zoomControl: false, layers: [osm] }).setView([54.5, -2.5], 6);
+    L.control.layers({ 'Street map': osm, 'Light': light, 'Dark': dark }, {}, { position: 'topright' }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
     stationLayer = L.layerGroup().addTo(map);
     odLayer = L.layerGroup().addTo(map);
 }
@@ -71,14 +79,13 @@ async function loadStations() {
     }
 }
 
-// --- search box ---
+// --- origin search box ---
 function initSearch() {
     const input = document.getElementById('search');
     input.addEventListener('change', () => {
         const tlc = tlcByName[input.value.trim()];
         if (tlc) selectOrigin(tlc);
     });
-    // also respond to Enter when a partial match exists
     input.addEventListener('keydown', e => {
         if (e.key !== 'Enter') return;
         const val = input.value.trim().toLowerCase();
@@ -91,15 +98,15 @@ function initSearch() {
 async function selectOrigin(tlc) {
     if (!stations[tlc]) return;
 
-    // reset previous origin marker
     if (selectedOrigin && stationMarkers[selectedOrigin]) {
         stationMarkers[selectedOrigin].setStyle({ ...STATION_STYLE });
     }
 
     selectedOrigin = tlc;
+    destFilter = null;
+    displayLimit = 15;
     stationMarkers[tlc].setStyle({ ...ORIGIN_STYLE });
     stationMarkers[tlc].bringToFront();
-
     document.getElementById('search').value = stations[tlc].n;
     setPanelLoading();
 
@@ -107,16 +114,21 @@ async function selectOrigin(tlc) {
         const resp = await fetch(`od-data/${safeFilename(tlc)}.json`);
         if (!resp.ok) throw new Error('not found');
         currentPairs = await resp.json();
+        odCache[tlc] = currentPairs;
     } catch {
         setPanelError();
         return;
     }
 
-    minJourneys = 1;
-    resetSlider();
     renderOD();
     renderPanel();
     document.getElementById('legend').style.display = '';
+}
+
+// --- returns the pairs that should currently be drawn / shown ---
+function getVisiblePairs() {
+    if (destFilter) return currentPairs.filter(([dest]) => dest === destFilter);
+    return displayLimit === Infinity ? currentPairs : currentPairs.slice(0, displayLimit);
 }
 
 // --- draw OD lines ---
@@ -127,8 +139,7 @@ function renderOD() {
     const origin = stations[selectedOrigin];
     const logMax = currentPairs.length ? Math.log10(currentPairs[0][1] + 1) : 1;
 
-    for (const [dest, journeys] of currentPairs) {
-        if (journeys < minJourneys) break; // sorted desc, safe to break early
+    for (const [dest, journeys] of getVisiblePairs()) {
         const d = stations[dest];
         if (!d) continue;
 
@@ -149,7 +160,7 @@ function renderOD() {
     }
 }
 
-// --- panel rendering ---
+// --- panel state helpers ---
 function setPanelLoading() {
     document.getElementById('panel-body').innerHTML = '<p class="loading">Loading…</p>';
 }
@@ -158,72 +169,176 @@ function setPanelError() {
     document.getElementById('panel-body').innerHTML = '<p class="hint">No OD data found for this station.</p>';
 }
 
+// --- full panel render ---
 function renderPanel() {
     const s = stations[selectedOrigin];
-    const filtered = currentPairs.filter(([, j]) => j >= minJourneys);
-    const totalJ = filtered.reduce((sum, [, j]) => sum + j, 0);
-    const logMax = currentPairs.length ? Math.log10(currentPairs[0][1] + 1) : 1;
-    // slider max maps to logMax (in tenths)
-    const sliderMax = Math.ceil(logMax * 10);
+    const totalDests = currentPairs.length;
+    const totalJourneys = currentPairs.reduce((sum, [, j]) => sum + j, 0);
+    const visible = getVisiblePairs();
+    const visibleJ = visible.reduce((sum, [, j]) => sum + j, 0);
 
-    const topItems = filtered.slice(0, 10).map(([dest, j]) => {
+    const sliderVal = destFilter ? 0
+        : (displayLimit === Infinity ? totalDests : Math.min(displayLimit, totalDests));
+    const limitLabel = destFilter ? '—'
+        : (displayLimit === Infinity ? `All (${totalDests.toLocaleString()})` : Math.min(displayLimit, totalDests).toLocaleString());
+
+    // Destination datalist options (all pairs for this origin)
+    const destOptions = currentPairs.map(([dest]) => {
         const name = stations[dest]?.n ?? dest;
-        return `<div class="top-item" onclick="flyToStation('${dest}')">
-          <span class="dest-name">${name}</span>
-          <span class="journey-count">${j.toLocaleString()}</span>
-        </div>`;
+        return `<option value="${name}">`;
     }).join('');
+
+    // Top list: show up to 10 from visible, or the filtered single entry
+    const listPairs = visible.slice(0, destFilter ? visible.length : 10);
+    const topItems = listPairs.length
+        ? listPairs.map(([dest, j]) => {
+            const name = stations[dest]?.n ?? dest;
+            return `<div class="top-item" onclick="flyToStation('${dest}')">
+              <span class="dest-name">${name}</span>
+              <span class="journey-count">${j.toLocaleString()}</span>
+            </div>`;
+          }).join('')
+        : '<p class="hint" style="margin-top:4px">No matching destination.</p>';
+
+    const destFilterName = destFilter ? (stations[destFilter]?.n ?? destFilter) : '';
 
     document.getElementById('panel-body').innerHTML = `
       <div class="origin-name">${s.n}</div>
+
       <div class="stat-block">
         <div class="stat-row">
+          <span class="stat-label">Origin code</span>
+          <span class="stat-value mono">${selectedOrigin}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Total destinations</span>
+          <span class="stat-value">${totalDests.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Total journeys (all)</span>
+          <span class="stat-value">${totalJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
           <span class="stat-label">Destinations shown</span>
-          <span class="stat-value" id="dest-count">${filtered.length.toLocaleString()}</span>
+          <span class="stat-value" id="dest-count">${visible.length.toLocaleString()}</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">Journeys shown</span>
-          <span class="stat-value" id="journey-total">${totalJ.toLocaleString()}</span>
+          <span class="stat-value" id="journey-total">${visibleJ.toLocaleString()}</span>
         </div>
       </div>
+
       <div class="filter-block">
         <div class="filter-label">
-          <span>Min journeys</span>
-          <span id="min-label">${minJourneys.toLocaleString()}</span>
+          <span>Destinations shown</span>
+          <span id="limit-label">${limitLabel}</span>
         </div>
-        <input id="min-journeys" type="range" min="0" max="${sliderMax}" step="1" value="0" />
+        <div class="preset-btns">
+          <button class="preset-btn${!destFilter && displayLimit === 15 ? ' active' : ''}" onclick="setLimit(15)">Top 15</button>
+          <button class="preset-btn${!destFilter && displayLimit === 50 ? ' active' : ''}" onclick="setLimit(50)">Top 50</button>
+          <button class="preset-btn${!destFilter && displayLimit === 100 ? ' active' : ''}" onclick="setLimit(100)">Top 100</button>
+          <button class="preset-btn${!destFilter && displayLimit === Infinity ? ' active' : ''}" onclick="setLimit(Infinity)">All</button>
+        </div>
+        <input id="dest-limit" type="range" min="1" max="${totalDests}" value="${sliderVal}" ${destFilter ? 'disabled' : ''} />
       </div>
+
+      <div class="dest-filter-section">
+        <div class="section-title">Filter to destination</div>
+        <div class="dest-filter-row">
+          <input id="dest-search" class="dest-search-input${destFilter ? ' active' : ''}" type="text"
+            list="dest-list-options" placeholder="Any destination…" autocomplete="off"
+            value="${destFilterName}" />
+          ${destFilter ? `<button class="clear-btn" onclick="clearDestFilter()" title="Clear filter">✕</button>` : ''}
+        </div>
+        <datalist id="dest-list-options">${destOptions}</datalist>
+        ${destFilter ? (() => {
+          const outbound = visible[0]?.[1] ?? null;
+          const inbound = getReverseJourneys(destFilter);
+          const rank = currentPairs.findIndex(([d]) => d === destFilter) + 1;
+          const destName = stations[destFilter]?.n ?? destFilter;
+          return `
+        <div class="dest-filter-stats">
+          <div class="stat-row"><span class="stat-label">Destination code</span><span class="stat-value mono">${destFilter}</span></div>
+          <div class="stat-row"><span class="stat-label">Rank from ${s.n.split(' ')[0]}</span><span class="stat-value">#${rank.toLocaleString()}</span></div>
+          <div class="stat-row"><span class="stat-label">${s.n.split(' ')[0]} → ${destName.split(' ')[0]}</span><span class="stat-value">${outbound !== null ? outbound.toLocaleString() : '—'}</span></div>
+          <div class="stat-row"><span class="stat-label">${destName.split(' ')[0]} → ${s.n.split(' ')[0]}</span><span class="stat-value">${inbound !== null ? inbound.toLocaleString() : '…'}</span></div>
+        </div>`;
+        })() : ''}
+      </div>
+
       <div class="section-title">Top destinations</div>
       <div class="top-list" id="top-list">${topItems}</div>
     `;
 
-    document.getElementById('min-journeys').addEventListener('input', onSliderChange);
+    document.getElementById('dest-limit').addEventListener('input', onLimitSlider);
+    document.getElementById('dest-search').addEventListener('change', onDestFilterChange);
 }
 
-function resetSlider() {
-    // slider is re-created in renderPanel, nothing to do here
-}
-
-function onSliderChange(e) {
-    const val = parseInt(e.target.value, 10);
-    minJourneys = Math.max(1, Math.round(Math.pow(10, val / 10)));
-    document.getElementById('min-label').textContent = minJourneys.toLocaleString();
-
+// --- set display limit via button ---
+function setLimit(n) {
+    if (!selectedOrigin) return;
+    destFilter = null;
+    displayLimit = n;
     renderOD();
+    renderPanel();
+}
 
-    const filtered = currentPairs.filter(([, j]) => j >= minJourneys);
-    const totalJ = filtered.reduce((sum, [, j]) => sum + j, 0);
-    document.getElementById('dest-count').textContent = filtered.length.toLocaleString();
-    document.getElementById('journey-total').textContent = totalJ.toLocaleString();
+// --- slider drives display limit ---
+function onLimitSlider(e) {
+    const val = parseInt(e.target.value, 10);
+    const atMax = val >= currentPairs.length;
+    displayLimit = atMax ? Infinity : val;
+    const label = document.getElementById('limit-label');
+    if (label) label.textContent = atMax ? `All (${currentPairs.length.toLocaleString()})` : val.toLocaleString();
+    renderOD();
+    refreshStats();
+}
 
-    const topItems = filtered.slice(0, 10).map(([dest, j]) => {
-        const name = stations[dest]?.n ?? dest;
-        return `<div class="top-item" onclick="flyToStation('${dest}')">
-          <span class="dest-name">${name}</span>
-          <span class="journey-count">${j.toLocaleString()}</span>
-        </div>`;
-    }).join('');
-    document.getElementById('top-list').innerHTML = topItems;
+// --- lightweight stat refresh without full panel re-render ---
+function refreshStats() {
+    const visible = getVisiblePairs();
+    const visibleJ = visible.reduce((sum, [, j]) => sum + j, 0);
+    const dcEl = document.getElementById('dest-count');
+    const jtEl = document.getElementById('journey-total');
+    if (dcEl) dcEl.textContent = visible.length.toLocaleString();
+    if (jtEl) jtEl.textContent = visibleJ.toLocaleString();
+}
+
+// --- destination filter ---
+async function onDestFilterChange(e) {
+    const val = e.target.value.trim();
+    if (!val) { clearDestFilter(); return; }
+    const tlc = tlcByName[val];
+    if (!tlc || !currentPairs.find(([d]) => d === tlc)) return;
+    await applyDestFilter(tlc);
+}
+
+async function applyDestFilter(tlc) {
+    destFilter = tlc;
+    renderOD();
+    renderPanel(); // renders immediately with "…" for reverse count
+
+    if (!odCache[tlc]) {
+        try {
+            const resp = await fetch(`od-data/${safeFilename(tlc)}.json`);
+            if (resp.ok) odCache[tlc] = await resp.json();
+        } catch {}
+    }
+    // Re-render only if the user hasn't changed the filter in the meantime
+    if (destFilter === tlc) renderPanel();
+}
+
+function getReverseJourneys(destTlc) {
+    const pairs = odCache[destTlc];
+    if (!pairs) return null; // still loading
+    const pair = pairs.find(([d]) => d === selectedOrigin);
+    return pair ? pair[1] : 0;
+}
+
+function clearDestFilter() {
+    destFilter = null;
+    renderOD();
+    renderPanel();
 }
 
 // --- fly to a destination station (called from top-list onclick) ---
@@ -231,8 +346,20 @@ function flyToStation(tlc) {
     const s = stations[tlc];
     if (!s) return;
     map.flyTo([s.la, s.lo], Math.max(map.getZoom(), 9), { duration: 0.8 });
-    if (stationMarkers[tlc]) {
-        stationMarkers[tlc].openTooltip();
+    if (stationMarkers[tlc]) stationMarkers[tlc].openTooltip();
+}
+
+// --- pulls the ODM period (e.g. "2024/25") out of meta.json, if the build wrote one ---
+async function loadMeta() {
+    try {
+        const resp = await fetch('meta.json');
+        if (!resp.ok) return;
+        const meta = await resp.json();
+        if (meta.odmPeriod) {
+            document.getElementById('panel-year').textContent = `Based on ${meta.odmPeriod} estimates`;
+        }
+    } catch {
+        // no meta.json (older build) — static label in index.html stands
     }
 }
 
@@ -240,7 +367,9 @@ function flyToStation(tlc) {
 async function init() {
     initMap();
     await loadStations();
+    await loadMeta();
     initSearch();
+    await selectOrigin('KGX');
 }
 
 document.addEventListener('DOMContentLoaded', init);

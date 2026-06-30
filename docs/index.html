@@ -23,15 +23,19 @@
       top: 16px;
       left: 16px;
       z-index: 1000;
-      width: 280px;
+      width: 290px;
+      max-height: calc(100vh - 32px);
       background: rgba(15, 25, 35, 0.92);
       border: 1px solid #1e3a4a;
       border-radius: 8px;
       backdrop-filter: blur(6px);
+      display: flex;
+      flex-direction: column;
       overflow: hidden;
     }
 
     #panel-header {
+      flex-shrink: 0;
       padding: 14px 16px 10px;
       border-bottom: 1px solid #1e3a4a;
     }
@@ -42,7 +46,14 @@
       letter-spacing: 0.05em;
       text-transform: uppercase;
       color: #4fc3f7;
+      margin-bottom: 4px;
+    }
+
+    #panel-year {
+      font-size: 11px;
+      color: #546e7a;
       margin-bottom: 10px;
+      letter-spacing: 0.02em;
     }
 
     #search-wrapper { position: relative; }
@@ -61,7 +72,28 @@
     #search:focus { border-color: #4fc3f7; }
     #search::placeholder { color: #546e7a; }
 
-    #panel-body { padding: 14px 16px; }
+    #panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      scrollbar-width: thin;
+      scrollbar-color: #1e3a4a transparent;
+    }
+    #panel-body::-webkit-scrollbar { width: 4px; }
+    #panel-body::-webkit-scrollbar-track { background: transparent; }
+    #panel-body::-webkit-scrollbar-thumb { background: #1e3a4a; border-radius: 2px; }
+
+    #panel-footer {
+      flex-shrink: 0;
+      padding: 10px 16px;
+      border-top: 1px solid #1e3a4a;
+      font-size: 10px;
+      color: #37474f;
+      line-height: 1.6;
+    }
+    #panel-footer a { color: #546e7a; text-decoration: none; }
+    #panel-footer a:hover { color: #78909c; }
+    #panel-footer strong { color: #546e7a; }
 
     .hint {
       font-size: 12px;
@@ -87,6 +119,7 @@
     }
     .stat-label { color: #78909c; }
     .stat-value { font-weight: 600; color: #eceff1; }
+    .stat-value.mono { font-family: monospace; font-size: 11px; letter-spacing: 0.05em; }
 
     .origin-name {
       font-size: 15px;
@@ -102,14 +135,85 @@
       justify-content: space-between;
       font-size: 11px;
       color: #78909c;
-      margin-bottom: 5px;
+      margin-bottom: 6px;
     }
     .filter-label span:last-child { color: #4fc3f7; font-weight: 600; }
 
-    #min-journeys {
+    .preset-btns {
+      display: flex;
+      gap: 5px;
+      margin-bottom: 8px;
+    }
+
+    .preset-btn {
+      flex: 1;
+      padding: 4px 0;
+      font-size: 11px;
+      background: #0d1f2d;
+      border: 1px solid #1e3a4a;
+      border-radius: 4px;
+      color: #78909c;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .preset-btn:hover { border-color: #4fc3f7; color: #4fc3f7; }
+    .preset-btn.active { background: #0d3349; border-color: #4fc3f7; color: #4fc3f7; font-weight: 600; }
+
+    #dest-limit {
       width: 100%;
       accent-color: #4fc3f7;
       cursor: pointer;
+    }
+    #dest-limit:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .dest-filter-section { margin-bottom: 14px; }
+
+    .dest-filter-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .dest-search-input {
+      flex: 1;
+      padding: 7px 9px;
+      background: #0d1f2d;
+      border: 1px solid #1e3a4a;
+      border-radius: 5px;
+      color: #eceff1;
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.15s;
+      min-width: 0;
+    }
+    .dest-search-input:focus { border-color: #4fc3f7; }
+    .dest-search-input::placeholder { color: #546e7a; }
+    .dest-search-input.active { border-color: #fdd835; }
+
+    .clear-btn {
+      flex-shrink: 0;
+      width: 26px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: 1px solid #1e3a4a;
+      border-radius: 4px;
+      color: #546e7a;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.15s;
+    }
+    .clear-btn:hover { border-color: #e53935; color: #e53935; }
+
+    .dest-filter-stats {
+      background: #0a1820;
+      border: 1px solid #1e3a4a;
+      border-radius: 5px;
+      padding: 6px 10px;
+      margin-top: 4px;
     }
 
     .section-title {
@@ -161,6 +265,19 @@
       justify-content: space-between;
       font-size: 10px;
     }
+
+    /* Override Leaflet layer control to match dark theme */
+    .leaflet-control-layers {
+      background: rgba(15, 25, 35, 0.92) !important;
+      border: 1px solid #1e3a4a !important;
+      border-radius: 6px !important;
+      color: #cfd8dc !important;
+    }
+    .leaflet-control-layers-toggle {
+      background-color: rgba(15, 25, 35, 0.92) !important;
+    }
+    .leaflet-control-layers label { color: #cfd8dc; font-size: 12px; }
+    .leaflet-control-layers-separator { border-top-color: #1e3a4a; }
   </style>
 </head>
 <body>
@@ -169,13 +286,19 @@
   <div id="panel">
     <div id="panel-header">
       <h1>UK Rail O/D Explorer</h1>
+      <p id="panel-year">Based on 2024/25 estimates</p>
       <div id="search-wrapper">
-        <input id="search" type="text" list="station-list" placeholder="Search for a station..." autocomplete="off" />
+        <input id="search" type="text" list="station-list" placeholder="Search for an origin station…" autocomplete="off" />
         <datalist id="station-list"></datalist>
       </div>
     </div>
     <div id="panel-body">
       <p class="hint">Search above or click a station on the map to explore journey patterns.</p>
+    </div>
+    <div id="panel-footer">
+      <strong>Data sources</strong><br>
+      OD data: <a href="https://dataportal.orr.gov.uk/statistics/usage/estimates-of-station-usage/" target="_blank" rel="noopener">Office of Rail and Road</a> (Open Government Licence v3.0)<br>
+      Stations: <a href="https://github.com/davwheat/uk-railway-stations" target="_blank" rel="noopener">davwheat/uk-railway-stations</a>
     </div>
   </div>
 

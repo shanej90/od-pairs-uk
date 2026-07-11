@@ -162,11 +162,11 @@ function renderOD() {
 
 // --- panel state helpers ---
 function setPanelLoading() {
-    document.getElementById('panel-body').innerHTML = '<p class="loading">Loading…</p>';
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Loading…</p>';
 }
 
 function setPanelError() {
-    document.getElementById('panel-body').innerHTML = '<p class="hint">No OD data found for this station.</p>';
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small">No OD data found for this station.</p>';
 }
 
 // --- full panel render ---
@@ -198,14 +198,14 @@ function renderPanel() {
               <span class="journey-count">${j.toLocaleString()}</span>
             </div>`;
           }).join('')
-        : '<p class="hint" style="margin-top:4px">No matching destination.</p>';
+        : '<p class="text-muted small mt-1">No matching destination.</p>';
 
     const destFilterName = destFilter ? (stations[destFilter]?.n ?? destFilter) : '';
 
     document.getElementById('panel-body').innerHTML = `
       <div class="origin-name">${s.n}</div>
 
-      <div class="stat-block">
+      <div class="mb-3">
         <div class="stat-row">
           <span class="stat-label">Origin code</span>
           <span class="stat-value mono">${selectedOrigin}</span>
@@ -228,27 +228,27 @@ function renderPanel() {
         </div>
       </div>
 
-      <div class="filter-block">
-        <div class="filter-label">
+      <div class="mb-3">
+        <div class="d-flex justify-content-between text-muted mb-1" style="font-size:0.7rem">
           <span>Destinations shown</span>
-          <span id="limit-label">${limitLabel}</span>
+          <span id="limit-label" class="text-info fw-semibold">${limitLabel}</span>
         </div>
-        <div class="preset-btns">
-          <button class="preset-btn${!destFilter && displayLimit === 15 ? ' active' : ''}" onclick="setLimit(15)">Top 15</button>
-          <button class="preset-btn${!destFilter && displayLimit === 50 ? ' active' : ''}" onclick="setLimit(50)">Top 50</button>
-          <button class="preset-btn${!destFilter && displayLimit === 100 ? ' active' : ''}" onclick="setLimit(100)">Top 100</button>
-          <button class="preset-btn${!destFilter && displayLimit === Infinity ? ' active' : ''}" onclick="setLimit(Infinity)">All</button>
+        <div class="d-flex gap-1 mb-2">
+          <button class="${!destFilter && displayLimit === 15 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLimit(15)">Top 15</button>
+          <button class="${!destFilter && displayLimit === 50 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLimit(50)">Top 50</button>
+          <button class="${!destFilter && displayLimit === 100 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLimit(100)">Top 100</button>
+          <button class="${!destFilter && displayLimit === Infinity ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLimit(Infinity)">All</button>
         </div>
-        <input id="dest-limit" type="range" min="1" max="${totalDests}" value="${sliderVal}" ${destFilter ? 'disabled' : ''} />
+        <input id="dest-limit" type="range" class="form-range" min="1" max="${totalDests}" value="${sliderVal}" ${destFilter ? 'disabled' : ''} />
       </div>
 
-      <div class="dest-filter-section">
-        <div class="section-title">Filter to destination</div>
-        <div class="dest-filter-row">
-          <input id="dest-search" class="dest-search-input${destFilter ? ' active' : ''}" type="text"
+      <div class="mb-3">
+        <div class="text-uppercase text-muted mb-1" style="font-size:0.7rem;letter-spacing:0.06em">Filter to destination</div>
+        <div class="d-flex gap-2 align-items-center mb-1">
+          <input id="dest-search" class="form-control form-control-sm flex-fill${destFilter ? ' border-warning' : ''}" type="text"
             list="dest-list-options" placeholder="Any destination…" autocomplete="off"
             value="${destFilterName}" />
-          ${destFilter ? `<button class="clear-btn" onclick="clearDestFilter()" title="Clear filter">✕</button>` : ''}
+          ${destFilter ? `<button class="btn btn-sm btn-outline-danger px-2" onclick="clearDestFilter()" title="Clear filter">✕</button>` : ''}
         </div>
         <datalist id="dest-list-options">${destOptions}</datalist>
         ${destFilter ? (() => {
@@ -257,7 +257,7 @@ function renderPanel() {
           const rank = currentPairs.findIndex(([d]) => d === destFilter) + 1;
           const destName = stations[destFilter]?.n ?? destFilter;
           return `
-        <div class="dest-filter-stats">
+        <div class="rounded p-2 mt-1" style="background:rgba(0,0,0,0.25)">
           <div class="stat-row"><span class="stat-label">Destination code</span><span class="stat-value mono">${destFilter}</span></div>
           <div class="stat-row"><span class="stat-label">Rank from ${s.n.split(' ')[0]}</span><span class="stat-value">#${rank.toLocaleString()}</span></div>
           <div class="stat-row"><span class="stat-label">${s.n.split(' ')[0]} → ${destName.split(' ')[0]}</span><span class="stat-value">${outbound !== null ? outbound.toLocaleString() : '—'}</span></div>
@@ -266,8 +266,8 @@ function renderPanel() {
         })() : ''}
       </div>
 
-      <div class="section-title">Top destinations</div>
-      <div class="top-list" id="top-list">${topItems}</div>
+      <div class="text-uppercase text-muted mb-1" style="font-size:0.7rem;letter-spacing:0.06em">Top destinations</div>
+      <div id="top-list">${topItems}</div>
     `;
 
     document.getElementById('dest-limit').addEventListener('input', onLimitSlider);

@@ -43,4 +43,4 @@ Do this to bring in a new year's figures, or after fixing something in a source 
 
 ## A note on the AI involved
 
-The web app, the build script, and this README were written with assistance from Claude (Anthropic), used through Claude Code across several sessions, with the project owner directing the changes and testing each one. The underlying data — the ORR journey estimates and the station list — comes entirely from the sources credited above, not from the model.
+The web app, the build script, and this README were written with assistance from Claude (Anthropic), used through Claude Code across several sessions, with the project owner directing the changes and testing each one. The underlying data — the ORR journey estimates and the station list — comes entirely from the sources credited above, not from the model. Theme is [darkly](https://bootswatch.com/darkly/) from Bootswatch.

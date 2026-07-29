@@ -1,3 +1,9 @@
+// Hand-written JS, not an R/Python web layer: the OD matrix is pre-split into a few
+// thousand per-station JSON files (see scripts/build_od_data.py) and fetched lazily as
+// the user picks stations or draws a circle. That rules out crosstalk/ojs, which ship
+// one shared dataset to the browser up front, and a full Shiny/Dash server is overkill
+// for a GitHub Pages static site with no server-side state.
+
 // CON and PRN are reserved Windows filenames; build script prefixes them with _
 const WIN_RESERVED = new Set(['CON','PRN','AUX','NUL','COM0','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9','LPT0','LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9']);
 function safeFilename(tlc) { return WIN_RESERVED.has(tlc.toUpperCase()) ? `_${tlc}` : tlc; }
@@ -11,6 +17,15 @@ let currentPairs = [];   // [[dest_tlc, journeys], ...] sorted desc
 let displayLimit = 15;   // number of top destinations to show; Infinity = all
 let destFilter = null;   // TLC string when filtering to a single destination, else null
 const odCache = {};      // { TLC: pairs[] } — avoids re-fetching OD files
+
+// --- circle mode: pick a point + radius to analyse journeys in that area ---
+let circleShapeLayer, circleOdLayer; // the circle itself, and its drawn OD lines
+let circle = null;          // L.Circle, or null when no circle is active
+let placingCircle = false;  // true while waiting for the user to click the map to set/move the centre
+let circleRadiusKm = 10;    // current radius, editable via the panel's number input
+let circleDisplayLimit = 15; // how many "both" routes to draw, busiest first; Infinity = all
+let circleStats = null;     // { stations: [tlc,...], startJourneys, bothJourneys, bothEdges: [[o,d,journeys],...] }
+let circleComputeToken = 0; // guards a stale async recompute against a newer one superseding it
 
 const STATION_STYLE = { radius: 3, fillColor: '#607d8b', color: '#37474f', weight: 0.5, fillOpacity: 0.8 };
 const ORIGIN_STYLE  = { radius: 8, fillColor: '#fdd835', color: '#fff', weight: 1.5, fillOpacity: 1 };
@@ -55,6 +70,11 @@ function initMap() {
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     stationLayer = L.layerGroup().addTo(map);
     odLayer = L.layerGroup().addTo(map);
+    circleOdLayer = L.layerGroup().addTo(map);
+    circleShapeLayer = L.layerGroup().addTo(map);
+
+    // let the user cut a flyTo short by clicking/dragging, rather than fighting the animation
+    map.on('mousedown', () => map.stop());
 }
 
 // --- load stations.json and render dots ---
@@ -96,7 +116,7 @@ function initSearch() {
 
 // --- select origin station and load its OD data ---
 async function selectOrigin(tlc) {
-    if (!stations[tlc]) return;
+    if (!stations[tlc] || circle || placingCircle) return; // circle mode owns the map/panel while active
 
     if (selectedOrigin && stationMarkers[selectedOrigin]) {
         stationMarkers[selectedOrigin].setStyle({ ...STATION_STYLE });
@@ -109,6 +129,9 @@ async function selectOrigin(tlc) {
     stationMarkers[tlc].bringToFront();
     document.getElementById('search').value = stations[tlc].n;
     setPanelLoading();
+
+    const s = stations[tlc];
+    map.flyTo([s.la, s.lo], Math.max(map.getZoom(), 9), { duration: 1.2 }); // gradual pan, not a snap-jump; a click interrupts it
 
     try {
         const resp = await fetch(`od-data/${safeFilename(tlc)}.json`);
@@ -133,6 +156,7 @@ function getVisiblePairs() {
 
 // --- draw OD lines ---
 function renderOD() {
+    if (circle) return; // circle mode owns the map view while active
     odLayer.clearLayers();
     if (!selectedOrigin) return;
 
@@ -160,6 +184,336 @@ function renderOD() {
     }
 }
 
+// =====================================================================
+// Circle mode — pick a point and a radius to analyse the journeys in
+// that area, independent of whichever origin station was selected.
+// =====================================================================
+
+// --- suspends station-search mode while circle mode is active ---
+function deactivateOriginSelection() {
+    if (selectedOrigin && stationMarkers[selectedOrigin]) {
+        stationMarkers[selectedOrigin].setStyle({ ...STATION_STYLE });
+    }
+    selectedOrigin = null;
+    currentPairs = [];
+    destFilter = null;
+    odLayer.clearLayers();
+    document.getElementById('legend').style.display = 'none';
+
+    const search = document.getElementById('search');
+    search.value = '';
+    search.disabled = true;
+    search.placeholder = 'Circle mode active';
+}
+
+// --- hands map/panel control back to station-search mode ---
+function reactivateOriginSelection() {
+    const search = document.getElementById('search');
+    search.disabled = false;
+    search.placeholder = 'Search for an origin station…';
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small">Search above or click a station on the map to explore journey patterns.</p>';
+}
+
+// --- "Draw circle" button: starts placing a new circle, or cancels if already placing ---
+function toggleDrawCircle() {
+    if (placingCircle) { cancelPlacing(); return; }
+    enterPlacingMode();
+}
+
+// --- waits for one map click to set the circle's centre (a fresh circle, or moving an existing one) ---
+function enterPlacingMode() {
+    if (placingCircle) return; // already waiting on a click; don't stack a second listener
+    placingCircle = true;
+    map.getContainer().style.cursor = 'crosshair';
+    map.once('click', onMapPickCenter);
+
+    if (!circle) {
+        deactivateOriginSelection();
+        document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Click the map to place the circle’s centre…</p>';
+        document.getElementById('circle-btn').textContent = 'Click the map…';
+        document.getElementById('circle-btn').classList.add('picking');
+    } else {
+        const moveBtn = document.getElementById('circle-move-btn');
+        if (moveBtn) { moveBtn.textContent = 'Click the map…'; moveBtn.classList.add('picking'); moveBtn.disabled = true; }
+    }
+}
+
+// --- Escape, or re-clicking "Draw circle", backs out of placing mode without side effects ---
+function cancelPlacing() {
+    if (!placingCircle) return;
+    placingCircle = false;
+    map.getContainer().style.cursor = '';
+    map.off('click', onMapPickCenter);
+
+    if (circle) {
+        renderCirclePanel(); // full re-render restores the normal "Move centre" button
+    } else {
+        document.getElementById('circle-btn').textContent = 'Draw circle';
+        document.getElementById('circle-btn').classList.remove('picking');
+        reactivateOriginSelection();
+    }
+}
+
+function onMapPickCenter(e) {
+    placingCircle = false;
+    map.getContainer().style.cursor = '';
+    document.getElementById('circle-btn').classList.remove('picking');
+
+    if (!circle) {
+        circle = L.circle(e.latlng, { radius: circleRadiusKm * 1000, color: '#26c6da', weight: 2, fillOpacity: 0.06 }).addTo(circleShapeLayer);
+        document.getElementById('circle-btn').style.display = 'none';
+        document.getElementById('legend').style.display = '';
+    } else {
+        circle.setLatLng(e.latlng);
+    }
+    recomputeCircle();
+}
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') cancelPlacing();
+});
+
+// --- removes the circle entirely and restores station-search mode ---
+function clearCircle() {
+    if (!circle) return;
+    if (placingCircle) {
+        placingCircle = false;
+        map.getContainer().style.cursor = '';
+        map.off('click', onMapPickCenter); // don't let a stray later click create a fresh circle
+    }
+
+    circleShapeLayer.clearLayers();
+    circleOdLayer.clearLayers();
+    circle = null;
+    circleStats = null;
+    circleDisplayLimit = 15;
+    circleComputeToken++; // invalidate any in-flight recompute
+
+    document.getElementById('circle-btn').style.display = '';
+    document.getElementById('circle-btn').textContent = 'Draw circle';
+    document.getElementById('circle-btn').classList.remove('picking');
+    document.getElementById('legend').style.display = 'none';
+
+    reactivateOriginSelection();
+}
+
+async function fetchOutbound(tlc) {
+    if (odCache[tlc]) return odCache[tlc];
+    try {
+        const resp = await fetch(`od-data/${safeFilename(tlc)}.json`);
+        odCache[tlc] = resp.ok ? await resp.json() : [];
+    } catch { odCache[tlc] = []; }
+    return odCache[tlc];
+}
+
+// --- sums journeys starting in the circle, and those staying entirely within it ---
+async function recomputeCircle() {
+    if (!circle) return;
+    const token = ++circleComputeToken;
+    const editingRadius = document.activeElement && document.activeElement.id === 'circle-radius-input';
+
+    circleOdLayer.clearLayers();
+    if (!editingRadius) setCirclePanelLoading();
+
+    const center = circle.getLatLng();
+    const radius = circle.getRadius();
+    const inCircle = Object.keys(stations).filter(
+        tlc => center.distanceTo(L.latLng(stations[tlc].la, stations[tlc].lo)) <= radius
+    );
+    const inSet = new Set(inCircle);
+
+    const outboundLists = await Promise.all(inCircle.map(fetchOutbound));
+    if (token !== circleComputeToken) return; // a newer recompute superseded this one
+
+    let startJourneys = 0; // every journey starting at a station in the circle, to any destination
+    let bothJourneys = 0;  // journeys where both origin and destination are in the circle
+    const bothEdges = [];  // [[origin, dest, journeys], ...], for drawing
+
+    inCircle.forEach((tlc, i) => {
+        for (const [dest, journeys] of outboundLists[i]) {
+            startJourneys += journeys;
+            if (inSet.has(dest)) {
+                bothJourneys += journeys;
+                bothEdges.push([tlc, dest, journeys]);
+            }
+        }
+    });
+    bothEdges.sort((a, b) => b[2] - a[2]); // busiest first, so "top N" and the colour ramp both make sense
+
+    circleStats = { stations: inCircle, startJourneys, bothJourneys, bothEdges };
+    renderCircleOD();
+    renderCirclePanel();
+    updateCircleTooltip();
+}
+
+// --- the "both" edges currently on screen, limited by circleDisplayLimit ---
+function getVisibleCircleEdges() {
+    if (!circleStats) return [];
+    const { bothEdges } = circleStats;
+    return circleDisplayLimit === Infinity ? bothEdges : bothEdges.slice(0, circleDisplayLimit);
+}
+
+// --- draws only the journeys that stay entirely within the circle, capped to the display limit ---
+function renderCircleOD() {
+    circleOdLayer.clearLayers();
+    if (!circleStats) return;
+
+    const { bothEdges } = circleStats;
+    const logMax = bothEdges.length ? Math.log10(bothEdges[0][2] + 1) : 1; // scale is fixed to the busiest route, regardless of how many are shown
+
+    for (const [o, d, journeys] of getVisibleCircleEdges()) {
+        const os = stations[o], ds = stations[d];
+        if (!os || !ds) continue;
+
+        const ratio = logRatio(journeys, logMax);
+        const line = L.polyline([[os.la, os.lo], [ds.la, ds.lo]], {
+            color: journeyColor(ratio),
+            weight: 0.5 + ratio * 4,
+            opacity: 0.2 + ratio * 0.7,
+        });
+        line.bindTooltip(`<strong>${os.n} → ${ds.n}</strong><br>${journeys.toLocaleString()} journeys`, { sticky: true });
+        line.on('mouseover', function () { this.setStyle({ weight: this.options.weight + 1.5 }); });
+        line.on('mouseout',  function () { this.setStyle({ weight: this.options.weight - 1.5 }); });
+        line.addTo(circleOdLayer);
+    }
+}
+
+// --- permanent label on the circle itself, giving an at-a-glance summary ---
+function updateCircleTooltip() {
+    if (!circle || !circleStats) return;
+    const { stations: sList, startJourneys, bothJourneys } = circleStats;
+    const html = `<strong>${sList.length.toLocaleString()}</strong> station${sList.length === 1 ? '' : 's'}<br>`
+        + `${startJourneys.toLocaleString()} journeys start here<br>`
+        + `${bothJourneys.toLocaleString()} stay within the circle`;
+    circle.unbindTooltip();
+    circle.bindTooltip(html, { permanent: true, direction: 'center', className: 'circle-tooltip' });
+}
+
+function setCirclePanelLoading() {
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Computing journeys in circle…</p>';
+}
+
+// --- detailed stats panel for circle mode ---
+function renderCirclePanel() {
+    if (!circleStats) return;
+
+    // Don't blow away the radius input (and its focus) while the user is actively editing it
+    if (document.activeElement && document.activeElement.id === 'circle-radius-input') {
+        refreshCircleStats();
+        return;
+    }
+
+    const { stations: sList, startJourneys, bothJourneys, bothEdges } = circleStats;
+    const visible = getVisibleCircleEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const sliderVal = circleDisplayLimit === Infinity ? bothEdges.length : Math.min(circleDisplayLimit, bothEdges.length);
+    const limitLabel = circleDisplayLimit === Infinity ? `All (${bothEdges.length.toLocaleString()})` : sliderVal.toLocaleString();
+
+    document.getElementById('panel-body').innerHTML = `
+      <div class="origin-name">Circle analysis</div>
+      <div class="mb-3">
+        <div class="stat-row">
+          <span class="stat-label">Stations in circle</span>
+          <span class="stat-value" id="circle-station-count">${sList.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys starting in circle</span>
+          <span class="stat-value" id="circle-start-journeys">${startJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Start &amp; end in circle (all routes)</span>
+          <span class="stat-value" id="circle-both-journeys">${bothJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Routes shown</span>
+          <span class="stat-value" id="circle-routes-shown">${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys shown</span>
+          <span class="stat-value" id="circle-journeys-shown">${visibleJourneys.toLocaleString()}</span>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <div class="d-flex justify-content-between text-muted mb-1" style="font-size:0.7rem">
+          <label for="circle-limit-slider" class="mb-0">Routes shown (busiest first)</label>
+          <span id="circle-limit-label" class="text-info fw-semibold">${limitLabel}</span>
+        </div>
+        <div class="d-flex gap-1 mb-2">
+          <button class="${circleDisplayLimit === 15 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setCircleLimit(15)">Top 15</button>
+          <button class="${circleDisplayLimit === 50 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setCircleLimit(50)">Top 50</button>
+          <button class="${circleDisplayLimit === 100 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setCircleLimit(100)">Top 100</button>
+          <button class="${circleDisplayLimit === Infinity ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setCircleLimit(Infinity)">All</button>
+        </div>
+        <input id="circle-limit-slider" type="range" class="form-range" min="1" max="${Math.max(bothEdges.length, 1)}" value="${sliderVal}" />
+      </div>
+
+      <div class="mb-3">
+        <label class="text-uppercase text-muted mb-1 d-block" style="font-size:0.7rem;letter-spacing:0.06em" for="circle-radius-input">Radius (km)</label>
+        <input id="circle-radius-input" type="number" min="0.5" step="0.5" class="form-control form-control-sm" value="${circleRadiusKm}" />
+      </div>
+      <div class="d-flex gap-1">
+        <button id="circle-move-btn" class="btn btn-sm btn-outline-info flex-fill" onclick="enterPlacingMode()">Move centre</button>
+        <button class="btn btn-sm btn-outline-danger px-2" onclick="clearCircle()" title="Clear circle">✕</button>
+      </div>
+    `;
+    document.getElementById('circle-radius-input').addEventListener('input', onRadiusInput);
+    document.getElementById('circle-limit-slider').addEventListener('input', onCircleLimitSlider);
+}
+
+// --- lightweight stat refresh that doesn't touch the radius input (preserves focus/cursor) ---
+function refreshCircleStats() {
+    if (!circleStats) return;
+    const { stations: sList, startJourneys, bothJourneys, bothEdges } = circleStats;
+    const visible = getVisibleCircleEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const countEl = document.getElementById('circle-station-count');
+    const startEl = document.getElementById('circle-start-journeys');
+    const bothEl = document.getElementById('circle-both-journeys');
+    const shownRoutesEl = document.getElementById('circle-routes-shown');
+    const shownJourneysEl = document.getElementById('circle-journeys-shown');
+    if (countEl) countEl.textContent = sList.length.toLocaleString();
+    if (startEl) startEl.textContent = startJourneys.toLocaleString();
+    if (bothEl) bothEl.textContent = bothJourneys.toLocaleString();
+    if (shownRoutesEl) shownRoutesEl.textContent = `${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}`;
+    if (shownJourneysEl) shownJourneysEl.textContent = visibleJourneys.toLocaleString();
+}
+
+// --- set the "both" routes display limit via button ---
+function setCircleLimit(n) {
+    if (!circleStats) return;
+    circleDisplayLimit = n;
+    renderCircleOD();
+    renderCirclePanel();
+}
+
+// --- slider drives the same display limit ---
+function onCircleLimitSlider(e) {
+    if (!circleStats) return;
+    const val = parseInt(e.target.value, 10);
+    const atMax = val >= circleStats.bothEdges.length;
+    circleDisplayLimit = atMax ? Infinity : val;
+    const label = document.getElementById('circle-limit-label');
+    if (label) label.textContent = atMax ? `All (${circleStats.bothEdges.length.toLocaleString()})` : val.toLocaleString();
+    renderCircleOD();
+    refreshCircleStats();
+}
+
+let radiusDebounceTimer = null;
+function onRadiusInput(e) {
+    const km = parseFloat(e.target.value);
+    if (!isFinite(km) || km <= 0) return;
+    circleRadiusKm = km;
+    clearTimeout(radiusDebounceTimer);
+    radiusDebounceTimer = setTimeout(() => {
+        if (!circle) return;
+        circle.setRadius(circleRadiusKm * 1000);
+        recomputeCircle();
+    }, 400);
+}
+
 // --- panel state helpers ---
 function setPanelLoading() {
     document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Loading…</p>';
@@ -171,6 +525,7 @@ function setPanelError() {
 
 // --- full panel render ---
 function renderPanel() {
+    if (circle) return; // circle mode owns the panel while active
     const s = stations[selectedOrigin];
     const totalDests = currentPairs.length;
     const totalJourneys = currentPairs.reduce((sum, [, j]) => sum + j, 0);
@@ -230,7 +585,7 @@ function renderPanel() {
 
       <div class="mb-3">
         <div class="d-flex justify-content-between text-muted mb-1" style="font-size:0.7rem">
-          <span>Destinations shown</span>
+          <label for="dest-limit" class="mb-0">Destinations shown</label>
           <span id="limit-label" class="text-info fw-semibold">${limitLabel}</span>
         </div>
         <div class="d-flex gap-1 mb-2">
@@ -243,7 +598,7 @@ function renderPanel() {
       </div>
 
       <div class="mb-3">
-        <div class="text-uppercase text-muted mb-1" style="font-size:0.7rem;letter-spacing:0.06em">Filter to destination</div>
+        <label for="dest-search" class="text-uppercase text-muted mb-1 d-block" style="font-size:0.7rem;letter-spacing:0.06em">Filter to destination</label>
         <div class="d-flex gap-2 align-items-center mb-1">
           <input id="dest-search" class="form-control form-control-sm flex-fill${destFilter ? ' border-warning' : ''}" type="text"
             list="dest-list-options" placeholder="Any destination…" autocomplete="off"

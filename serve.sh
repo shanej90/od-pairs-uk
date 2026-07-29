@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Serve the docs/ folder on a local HTTP server for development/testing.
-# Usage: bash serve.sh [port]
+#serve the docs/ folder on a local HTTP server for development/testing.
+#usage: bash serve.sh [port]
+set -euo pipefail
 
 PORT=${1:-8000}
 URL="http://localhost:$PORT"

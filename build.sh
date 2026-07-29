@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Rebuild docs/stations.json and docs/od-data/*.json from the source CSVs in data/.
-# Usage:
-#   bash build.sh                                  # auto-detects data/ODM_for_RDM_*.csv
-#   bash build.sh --odm-file ODM_for_RDM_2025-26.csv   # picks a specific file
+#rebuild docs/stations.json and docs/od-data/*.json from the source CSVs in data/.
+#usage:
+#  bash build.sh                                  # auto-detects data/ODM_for_RDM_*.csv
+#  bash build.sh --odm-file ODM_for_RDM_2025-26.csv   # picks a specific file
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>UK Rail O/D Explorer</title>
+  <!-- darkly - the basemaps and OD lines are built for a dark canvas; a light theme would wash them out -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5/dist/darkly/bootstrap.min.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
@@ -76,6 +77,24 @@
     }
     .legend-ends { display: flex; justify-content: space-between; font-size: 0.65rem; }
 
+    /* circle draw/move button, while waiting for the user to click a centre point */
+    .btn.picking { background-color: var(--bs-info); color: #000; border-color: var(--bs-info); }
+
+    /* permanent tooltip shown on the drawn circle */
+    .circle-tooltip {
+      background: rgba(32, 35, 39, 0.92) !important;
+      border: 1px solid rgba(255,255,255,0.15) !important;
+      color: #fff !important;
+      font-size: 0.7rem;
+      line-height: 1.5;
+      text-align: center;
+      padding: 0.35rem 0.55rem;
+      border-radius: 6px;
+      box-shadow: none !important;
+      pointer-events: none;
+    }
+    .circle-tooltip::before { display: none; }
+
     /* Leaflet layer control */
     .leaflet-control-layers {
       background: rgba(32, 35, 39, 0.95) !important;
@@ -95,17 +114,19 @@
     <div id="panel-header" class="card-header pb-2">
       <h1 class="h6 text-info mb-1" style="letter-spacing:0.05em;text-transform:uppercase">UK Rail O/D Explorer</h1>
       <p id="panel-year" class="text-muted mb-2" style="font-size:0.7rem">Based on 2024/25 estimates</p>
+      <label for="search" class="visually-hidden">Search for an origin station</label>
       <input id="search" type="text" list="station-list" class="form-control form-control-sm" placeholder="Search for an origin station…" autocomplete="off" />
       <datalist id="station-list"></datalist>
+      <button id="circle-btn" class="btn btn-sm btn-outline-info w-100 mt-2" onclick="toggleDrawCircle()">Draw circle</button>
     </div>
     <div id="panel-body" class="card-body">
       <p class="text-muted small">Search above or click a station on the map to explore journey patterns.</p>
     </div>
     <div id="panel-footer" class="card-footer text-muted" style="font-size:0.65rem;line-height:1.6">
       <strong>Data sources</strong><br>
-      OD data: <a href="https://dataportal.orr.gov.uk/statistics/usage/estimates-of-station-usage/" target="_blank" rel="noopener">Office of Rail and Road</a> (Open Government Licence v3.0)<br>
-      Stations: <a href="https://github.com/davwheat/uk-railway-stations" target="_blank" rel="noopener">davwheat/uk-railway-stations</a><br>
-      Theme: <a href="https://bootswatch.com/darkly/" target="_blank" rel="noopener">Bootswatch Darkly</a>
+      OD data: <a href="https://dataportal.orr.gov.uk/statistics/usage/estimates-of-station-usage/" target="_blank" rel="noopener">Office of Rail and Road</a>, Open Government Licence v3.0. Retrieved 2026-06-23.<br>
+      Stations: <a href="https://github.com/davwheat/uk-railway-stations" target="_blank" rel="noopener">davwheat/uk-railway-stations</a> (see repository for current licence). Retrieved 2026-06-23.<br>
+      Theme: <a href="https://bootswatch.com/darkly/" target="_blank" rel="noopener">Bootswatch Darkly</a> by Thomas Park, MIT licence.
     </div>
   </div>
 

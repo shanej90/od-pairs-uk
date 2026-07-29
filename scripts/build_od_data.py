@@ -12,20 +12,20 @@ specific file (e.g. when data/ holds more than one year), pass --odm-file:
   python scripts/build_od_data.py --odm-file ODM_for_RDM_2025-26.csv
 """
 
+#imports###############################################
 import argparse
 import csv
-import glob
 import json
-import os
 import re
 import sys
 from collections import defaultdict
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(ROOT, "data")
-DOCS_DIR = os.path.join(ROOT, "docs")
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+DOCS_DIR = ROOT / "docs"
 
-# Windows device names that cannot be used as filenames; prefix with _ to avoid
+#windows device names that cannot be used as filenames; prefix with _ to avoid
 _WIN_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(10)),
@@ -33,18 +33,47 @@ _WIN_RESERVED = {
 }
 
 
+#helpers###############################################
 def safe_filename(tlc: str) -> str:
+
+    """
+    Prefix a TLC with `_` if it collides with a reserved Windows device name.
+
+    Args:
+        tlc: Three-letter station code.
+
+    Returns:
+        The TLC unchanged, or `_`-prefixed if reserved.
+    """
+
     return f"_{tlc}" if tlc.upper() in _WIN_RESERVED else tlc
 
 
-def find_odm_file(explicit_name: str | None) -> str:
+def find_odm_file(explicit_name: str | None) -> Path:
+
+    """
+    Resolve the ODM CSV to build from.
+
+    Args:
+        explicit_name: Filename (relative to `data/`) or absolute path from
+            `--odm-file`. If `None`, auto-detects the one `ODM_for_RDM_*.csv`
+            file in `data/`.
+
+    Returns:
+        Path to the ODM CSV.
+
+    Raises:
+        SystemExit: If the named file doesn't exist, or auto-detection finds
+            zero or more than one candidate.
+    """
+
     if explicit_name:
-        path = explicit_name if os.path.isabs(explicit_name) else os.path.join(DATA_DIR, explicit_name)
-        if not os.path.isfile(path):
+        path = Path(explicit_name) if Path(explicit_name).is_absolute() else DATA_DIR / explicit_name
+        if not path.is_file():
             sys.exit(f"ODM file not found: {path}")
         return path
 
-    candidates = sorted(glob.glob(os.path.join(DATA_DIR, "ODM_for_RDM_*.csv")))
+    candidates = sorted(DATA_DIR.glob("ODM_for_RDM_*.csv"))
     if not candidates:
         sys.exit(
             "No ODM file found in data/. Expected a file matching ODM_for_RDM_*.csv "
@@ -52,7 +81,7 @@ def find_odm_file(explicit_name: str | None) -> str:
             "--odm-file <name>."
         )
     if len(candidates) > 1:
-        names = "\n  ".join(os.path.basename(c) for c in candidates)
+        names = "\n  ".join(c.name for c in candidates)
         sys.exit(
             f"Multiple ODM files found in data/:\n  {names}\n"
             "Pass --odm-file <name> to pick one."
@@ -60,15 +89,25 @@ def find_odm_file(explicit_name: str | None) -> str:
     return candidates[0]
 
 
-def parse_odm_period(odm_path: str) -> str | None:
+def parse_odm_period(odm_path: Path) -> str | None:
     """Pull a 'YYYY-YY' style period out of the filename, e.g. ODM_for_RDM_2024-25.csv -> '2024/25'."""
-    m = re.search(r"(\d{4})-(\d{2})", os.path.basename(odm_path))
+    m = re.search(r"(\d{4})-(\d{2})", odm_path.name)
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
-def load_stations():
+def load_stations() -> dict[str, dict]:
+
+    """
+    Read station reference data out of `data/stations.csv`.
+
+    Returns:
+        `{tlc: {"n": name, "la": lat, "lo": lng}}`, skipping rows with
+        missing or unparseable coordinates.
+    """
+
     stations = {}
-    with open(os.path.join(DATA_DIR, "stations.csv"), encoding="utf-8") as f:
+
+    with open(DATA_DIR / "stations.csv", encoding = "utf-8") as f:
         for row in csv.DictReader(f):
             tlc = row["crsCode"].strip()
             try:
@@ -78,14 +117,27 @@ def load_stations():
                     "lo": round(float(row["long"]), 5),
                 }
             except ValueError:
-                pass  # skip rows with missing coords
+                pass  #skip rows with missing coords
+
     return stations
 
 
-def build_od_data(odm_path: str):
+def build_od_data(odm_path: Path) -> dict[str, list]:
+
+    """
+    Group the ODM CSV into per-origin destination/journey pairs.
+
+    Args:
+        odm_path: Path to the ODM CSV.
+
+    Returns:
+        `{origin_tlc: [[dest_tlc, journeys], ...]}`, unsorted.
+    """
+
     od = defaultdict(list)
     total = 0
-    with open(odm_path, encoding="utf-8") as f:
+
+    with open(odm_path, encoding = "utf-8") as f:
         for row in csv.DictReader(f):
             od[row["origin_tlc"].strip()].append(
                 [row["destination_tlc"].strip(), int(row["journeys"])]
@@ -93,43 +145,47 @@ def build_od_data(odm_path: str):
             total += 1
             if total % 200_000 == 0:
                 print(f"  {total:,} rows processed...")
+
     print(f"  {total:,} total OD pairs across {len(od)} origins")
     return od
 
 
+#entry point###############################################
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--odm-file",
-        help="ODM CSV filename, relative to data/ (or an absolute path). "
-             "If omitted, auto-detects a single ODM_for_RDM_*.csv file in data/.",
+        help = "ODM CSV filename, relative to data/ (or an absolute path). "
+               "If omitted, auto-detects a single ODM_for_RDM_*.csv file in data/.",
     )
     args = parser.parse_args()
 
     odm_path = find_odm_file(args.odm_file)
-    print(f"Using ODM file: {os.path.relpath(odm_path, ROOT)}")
+    try:
+        display_path = odm_path.relative_to(ROOT)
+    except ValueError:
+        display_path = odm_path  #--odm-file pointed outside the project; show the absolute path instead
+    print(f"Using ODM file: {display_path}")
 
     print("Loading stations...")
     stations = load_stations()
-    os.makedirs(DOCS_DIR, exist_ok=True)
-    with open(os.path.join(DOCS_DIR, "stations.json"), "w") as f:
-        json.dump(stations, f, separators=(",", ":"))
+    DOCS_DIR.mkdir(exist_ok = True)
+    (DOCS_DIR / "stations.json").write_text(json.dumps(stations, separators = (",", ":")))
     print(f"Written stations.json ({len(stations)} stations)")
 
     print("Processing OD matrix (this takes ~30s)...")
     od = build_od_data(odm_path)
 
-    out_dir = os.path.join(DOCS_DIR, "od-data")
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = DOCS_DIR / "od-data"
+    out_dir.mkdir(exist_ok = True)
     for origin, pairs in od.items():
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        with open(os.path.join(out_dir, f"{safe_filename(origin)}.json"), "w") as f:
-            json.dump(pairs, f, separators=(",", ":"))
+        pairs.sort(key = lambda x: x[1], reverse = True)
+        (out_dir / f"{safe_filename(origin)}.json").write_text(json.dumps(pairs, separators = (",", ":")))
     print(f"Written {len(od)} origin files to docs/od-data/")
 
     period = parse_odm_period(odm_path)
-    with open(os.path.join(DOCS_DIR, "meta.json"), "w") as f:
-        json.dump({"odmPeriod": period} if period else {}, f)
+    (DOCS_DIR / "meta.json").write_text(json.dumps({"odmPeriod": period} if period else {}))
     if period:
         print(f"Detected ODM period: {period} (written to docs/meta.json)")
     else:

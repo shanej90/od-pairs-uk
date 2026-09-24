@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3 - 2026-09-12
+
+- Added line mode: search for a named line (eg, "West Coast Main Line") to highlight its stations and draw the route.
+- Added two headline stats for line mode: journeys starting anywhere on the line, and journeys that both start and end on it.
+- Added the busiest-15/50/100/all control to line mode, same as station and area mode, so dense lines stay readable.
+- Added `scripts/lines_source.json` and `docs/lines.json`: around 60 hand-curated named lines, covering national main lines, regional and branch lines, the Elizabeth Line, Merseyrail, and London Overground's six post-2024 line names.
+- Station search, area mode, and line mode now hand off to one another cleanly - selecting one clears whichever of the other two was active.
+
 ## v0.2 - 2026-07-29
 
 - Added area mode: click a point on the map and set a radius in km to find every station within it. `Move centre` repositions it without redrawing.

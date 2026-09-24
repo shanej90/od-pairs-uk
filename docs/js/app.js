@@ -29,6 +29,15 @@ let circleComputeToken = 0; // guards a stale async recompute against a newer on
 
 const STATION_STYLE = { radius: 3, fillColor: '#607d8b', color: '#37474f', weight: 0.5, fillOpacity: 0.8 };
 const ORIGIN_STYLE  = { radius: 8, fillColor: '#fdd835', color: '#fff', weight: 1.5, fillOpacity: 1 };
+const LINE_STATION_STYLE = { radius: 4, fillColor: '#66bb6a', color: '#2e7d32', weight: 1, fillOpacity: 0.9 };
+
+// --- line mode: pick a named line to see journey stats for its stations ---
+let lineShapeLayer, lineOdLayer;   // the route backbone, and its drawn "both ends on the line" OD edges
+let lines = {};              // { "Line Name": [tlc, ...] } in route order, from lines.json
+let selectedLine = null;     // line name string, or null when no line is selected
+let lineDisplayLimit = 15;   // how many "both" routes to draw, busiest first; Infinity = all
+let lineStatsData = null;    // { stations: [tlc,...], startJourneys, bothJourneys, bothEdges: [[o,d,journeys],...] }
+let lineComputeToken = 0;    // guards a stale async recompute against a newer one superseding it
 
 // --- colour ramp: blue → cyan → orange → red (log-scaled) ---
 function journeyColor(ratio) {
@@ -72,6 +81,8 @@ function initMap() {
     odLayer = L.layerGroup().addTo(map);
     circleOdLayer = L.layerGroup().addTo(map);
     circleShapeLayer = L.layerGroup().addTo(map);
+    lineShapeLayer = L.layerGroup().addTo(map);
+    lineOdLayer = L.layerGroup().addTo(map);
 
     // let the user cut a flyTo short by clicking/dragging, rather than fighting the animation
     map.on('mousedown', () => map.stop());
@@ -116,7 +127,9 @@ function initSearch() {
 
 // --- select origin station and load its OD data ---
 async function selectOrigin(tlc) {
-    if (!stations[tlc] || circle || placingCircle) return; // circle mode owns the map/panel while active
+    if (!stations[tlc] || placingCircle) return; // mid-pick for a circle owns the next map click
+    if (circle) clearCircle();
+    if (selectedLine) clearLine();
 
     if (selectedOrigin && stationMarkers[selectedOrigin]) {
         stationMarkers[selectedOrigin].setStyle({ ...STATION_STYLE });
@@ -189,8 +202,8 @@ function renderOD() {
 // that area, independent of whichever origin station was selected.
 // =====================================================================
 
-// --- suspends station-search mode while circle mode is active ---
-function deactivateOriginSelection() {
+// --- suspends station-search mode while circle or line mode is active ---
+function deactivateOriginSelection(message = 'Circle mode active') {
     if (selectedOrigin && stationMarkers[selectedOrigin]) {
         stationMarkers[selectedOrigin].setStyle({ ...STATION_STYLE });
     }
@@ -203,7 +216,7 @@ function deactivateOriginSelection() {
     const search = document.getElementById('search');
     search.value = '';
     search.disabled = true;
-    search.placeholder = 'Circle mode active';
+    search.placeholder = message;
 }
 
 // --- hands map/panel control back to station-search mode ---
@@ -223,6 +236,7 @@ function toggleDrawCircle() {
 // --- waits for one map click to set the circle's centre (a fresh circle, or moving an existing one) ---
 function enterPlacingMode() {
     if (placingCircle) return; // already waiting on a click; don't stack a second listener
+    if (selectedLine) clearLine();
     placingCircle = true;
     map.getContainer().style.cursor = 'crosshair';
     map.once('click', onMapPickCenter);
@@ -514,6 +528,247 @@ function onRadiusInput(e) {
     }, 400);
 }
 
+// =====================================================================
+// Line mode — pick a named line to see journey stats for its stations,
+// independent of whichever origin station or circle was active.
+// =====================================================================
+
+// --- load lines.json and populate the line search datalist ---
+async function loadLines() {
+    try {
+        const resp = await fetch('lines.json');
+        if (!resp.ok) return;
+        lines = await resp.json();
+    } catch {
+        return; // no lines.json (older build, or none configured) — feature just stays unused
+    }
+
+    const listEl = document.getElementById('line-list');
+    for (const name of Object.keys(lines).sort()) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        listEl.appendChild(opt);
+    }
+}
+
+// --- line search box ---
+function initLineSearch() {
+    const input = document.getElementById('line-search');
+    input.addEventListener('change', () => {
+        const name = input.value.trim();
+        if (lines[name]) selectLine(name);
+    });
+    input.addEventListener('keydown', e => {
+        if (e.key !== 'Enter') return;
+        const val = input.value.trim().toLowerCase();
+        const match = Object.keys(lines).find(n => n.toLowerCase().startsWith(val));
+        if (match) selectLine(match);
+    });
+}
+
+// --- select a named line and load journey stats for its stations ---
+async function selectLine(name) {
+    if (!lines[name] || placingCircle) return;
+    if (circle) clearCircle();
+
+    deactivateOriginSelection('Line mode active');
+    selectedLine = name;
+    lineDisplayLimit = 15;
+    document.getElementById('line-search').value = name;
+    setLinePanelLoading();
+
+    const tlcs = lines[name].filter(tlc => stations[tlc]);
+    const coords = tlcs.map(tlc => [stations[tlc].la, stations[tlc].lo]);
+
+    for (const tlc of tlcs) {
+        stationMarkers[tlc].setStyle({ ...LINE_STATION_STYLE });
+        stationMarkers[tlc].bringToFront();
+    }
+    L.polyline(coords, { color: '#66bb6a', weight: 3, opacity: 0.6 }).addTo(lineShapeLayer);
+
+    if (coords.length) {
+        map.flyToBounds(L.latLngBounds(coords), { padding: [50, 50], duration: 1.2 });
+    }
+
+    document.getElementById('legend').style.display = '';
+    await recomputeLine();
+}
+
+// --- sums journeys starting on the line, and those staying entirely on it ---
+async function recomputeLine() {
+    if (!selectedLine) return;
+    const token = ++lineComputeToken;
+
+    const tlcs = lines[selectedLine].filter(tlc => stations[tlc]);
+    const lineSet = new Set(tlcs);
+
+    const outboundLists = await Promise.all(tlcs.map(fetchOutbound));
+    if (token !== lineComputeToken) return; // a newer recompute superseded this one
+
+    let startJourneys = 0; // every journey starting at a station on the line, to any destination
+    let bothJourneys = 0;  // journeys where both origin and destination are on the line
+    const bothEdges = [];  // [[origin, dest, journeys], ...], for drawing
+
+    tlcs.forEach((tlc, i) => {
+        for (const [dest, journeys] of outboundLists[i]) {
+            startJourneys += journeys;
+            if (lineSet.has(dest)) {
+                bothJourneys += journeys;
+                bothEdges.push([tlc, dest, journeys]);
+            }
+        }
+    });
+    bothEdges.sort((a, b) => b[2] - a[2]); // busiest first, so "top N" and the colour ramp both make sense
+
+    lineStatsData = { stations: tlcs, startJourneys, bothJourneys, bothEdges };
+    renderLineOD();
+    renderLinePanel();
+}
+
+// --- the "both" edges currently on screen, limited by lineDisplayLimit ---
+function getVisibleLineEdges() {
+    if (!lineStatsData) return [];
+    const { bothEdges } = lineStatsData;
+    return lineDisplayLimit === Infinity ? bothEdges : bothEdges.slice(0, lineDisplayLimit);
+}
+
+// --- draws only the journeys that stay entirely on the line, capped to the display limit ---
+function renderLineOD() {
+    lineOdLayer.clearLayers();
+    if (!lineStatsData) return;
+
+    const { bothEdges } = lineStatsData;
+    const logMax = bothEdges.length ? Math.log10(bothEdges[0][2] + 1) : 1; // scale is fixed to the busiest route, regardless of how many are shown
+
+    for (const [o, d, journeys] of getVisibleLineEdges()) {
+        const os = stations[o], ds = stations[d];
+        if (!os || !ds) continue;
+
+        const ratio = logRatio(journeys, logMax);
+        const line = L.polyline([[os.la, os.lo], [ds.la, ds.lo]], {
+            color: journeyColor(ratio),
+            weight: 0.5 + ratio * 4,
+            opacity: 0.2 + ratio * 0.7,
+        });
+        line.bindTooltip(`<strong>${os.n} → ${ds.n}</strong><br>${journeys.toLocaleString()} journeys`, { sticky: true });
+        line.on('mouseover', function () { this.setStyle({ weight: this.options.weight + 1.5 }); });
+        line.on('mouseout',  function () { this.setStyle({ weight: this.options.weight - 1.5 }); });
+        line.addTo(lineOdLayer);
+    }
+}
+
+function setLinePanelLoading() {
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Computing journeys on line…</p>';
+}
+
+// --- detailed stats panel for line mode ---
+function renderLinePanel() {
+    if (!lineStatsData) return;
+
+    const { stations: sList, startJourneys, bothJourneys, bothEdges } = lineStatsData;
+    const visible = getVisibleLineEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const sliderVal = lineDisplayLimit === Infinity ? bothEdges.length : Math.min(lineDisplayLimit, bothEdges.length);
+    const limitLabel = lineDisplayLimit === Infinity ? `All (${bothEdges.length.toLocaleString()})` : sliderVal.toLocaleString();
+
+    document.getElementById('panel-body').innerHTML = `
+      <div class="origin-name">${selectedLine}</div>
+      <div class="mb-3">
+        <div class="stat-row">
+          <span class="stat-label">Stations on line</span>
+          <span class="stat-value" id="line-station-count">${sList.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys starting on line</span>
+          <span class="stat-value" id="line-start-journeys">${startJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Start &amp; end on line (all routes)</span>
+          <span class="stat-value" id="line-both-journeys">${bothJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Routes shown</span>
+          <span class="stat-value" id="line-routes-shown">${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys shown</span>
+          <span class="stat-value" id="line-journeys-shown">${visibleJourneys.toLocaleString()}</span>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <div class="d-flex justify-content-between text-muted mb-1" style="font-size:0.7rem">
+          <label for="line-limit-slider" class="mb-0">Routes shown (busiest first)</label>
+          <span id="line-limit-label" class="text-info fw-semibold">${limitLabel}</span>
+        </div>
+        <div class="d-flex gap-1 mb-2">
+          <button class="${lineDisplayLimit === 15 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLineLimit(15)">Top 15</button>
+          <button class="${lineDisplayLimit === 50 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLineLimit(50)">Top 50</button>
+          <button class="${lineDisplayLimit === 100 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLineLimit(100)">Top 100</button>
+          <button class="${lineDisplayLimit === Infinity ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setLineLimit(Infinity)">All</button>
+        </div>
+        <input id="line-limit-slider" type="range" class="form-range" min="1" max="${Math.max(bothEdges.length, 1)}" value="${sliderVal}" />
+      </div>
+
+      <button class="btn btn-sm btn-outline-danger w-100" onclick="clearLine()">Clear line</button>
+    `;
+    document.getElementById('line-limit-slider').addEventListener('input', onLineLimitSlider);
+}
+
+// --- set the "both" routes display limit via button ---
+function setLineLimit(n) {
+    if (!lineStatsData) return;
+    lineDisplayLimit = n;
+    renderLineOD();
+    renderLinePanel();
+}
+
+// --- slider drives the same display limit ---
+function onLineLimitSlider(e) {
+    if (!lineStatsData) return;
+    const val = parseInt(e.target.value, 10);
+    const atMax = val >= lineStatsData.bothEdges.length;
+    lineDisplayLimit = atMax ? Infinity : val;
+    const label = document.getElementById('line-limit-label');
+    if (label) label.textContent = atMax ? `All (${lineStatsData.bothEdges.length.toLocaleString()})` : val.toLocaleString();
+    renderLineOD();
+    refreshLineStats();
+}
+
+// --- lightweight stat refresh that avoids a full panel re-render ---
+function refreshLineStats() {
+    if (!lineStatsData) return;
+    const { bothEdges } = lineStatsData;
+    const visible = getVisibleLineEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const shownRoutesEl = document.getElementById('line-routes-shown');
+    const shownJourneysEl = document.getElementById('line-journeys-shown');
+    if (shownRoutesEl) shownRoutesEl.textContent = `${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}`;
+    if (shownJourneysEl) shownJourneysEl.textContent = visibleJourneys.toLocaleString();
+}
+
+// --- removes the line entirely and restores station-search mode ---
+function clearLine() {
+    if (!selectedLine) return;
+
+    for (const tlc of lines[selectedLine]) {
+        if (stationMarkers[tlc]) stationMarkers[tlc].setStyle({ ...STATION_STYLE });
+    }
+    lineShapeLayer.clearLayers();
+    lineOdLayer.clearLayers();
+    selectedLine = null;
+    lineStatsData = null;
+    lineDisplayLimit = 15;
+    lineComputeToken++; // invalidate any in-flight recompute
+
+    document.getElementById('line-search').value = '';
+    document.getElementById('legend').style.display = 'none';
+
+    reactivateOriginSelection();
+}
+
 // --- panel state helpers ---
 function setPanelLoading() {
     document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Loading…</p>';
@@ -723,7 +978,9 @@ async function init() {
     initMap();
     await loadStations();
     await loadMeta();
+    await loadLines();
     initSearch();
+    initLineSearch();
     await selectOrigin('KGX');
 }
 

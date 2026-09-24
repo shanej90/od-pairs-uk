@@ -5,6 +5,7 @@ Outputs:
   docs/stations.json        - station reference data (name, lat, lng)
   docs/od-data/{TLC}.json   - per-origin OD pairs, sorted by journeys desc
   docs/meta.json            - build metadata (e.g. the financial year the ODM covers)
+  docs/lines.json           - named line -> ordered station TLCs (from scripts/lines_source.json)
 
 By default, looks for a single file matching data/ODM_for_RDM_*.csv. To use a
 specific file (e.g. when data/ holds more than one year), pass --odm-file:
@@ -24,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 DOCS_DIR = ROOT / "docs"
+LINES_SOURCE = ROOT / "scripts" / "lines_source.json"
 
 #windows device names that cannot be used as filenames; prefix with _ to avoid
 _WIN_RESERVED = {
@@ -150,6 +152,41 @@ def build_od_data(odm_path: Path) -> dict[str, list]:
     return od
 
 
+def build_lines(stations: dict[str, dict]) -> dict[str, list]:
+
+    """
+    Filter the curated line definitions down to stations that actually exist.
+
+    Args:
+        stations: `{tlc: {...}}` as returned by `load_stations()`.
+
+    Returns:
+        `{line_name: [tlc, ...]}`, in the source file's route order, skipping
+        any line left with fewer than 2 known stations.
+    """
+
+    if not LINES_SOURCE.is_file():
+        print(f"No line definitions found at {LINES_SOURCE.relative_to(ROOT)}; skipping lines.json")
+        return {}
+
+    raw = json.loads(LINES_SOURCE.read_text(encoding = "utf-8"))
+    lines = {}
+    dropped_total = 0
+
+    for name, tlcs in raw.items():
+        kept = [tlc for tlc in tlcs if tlc in stations]
+        dropped_total += len(tlcs) - len(kept)
+        if len(kept) >= 2:
+            lines[name] = kept
+        else:
+            print(f"  Skipping '{name}': fewer than 2 known stations")
+
+    if dropped_total:
+        print(f"  Dropped {dropped_total} station code(s) not found in stations.csv")
+
+    return dict(sorted(lines.items()))
+
+
 #entry point###############################################
 def main():
 
@@ -173,6 +210,11 @@ def main():
     DOCS_DIR.mkdir(exist_ok = True)
     (DOCS_DIR / "stations.json").write_text(json.dumps(stations, separators = (",", ":")))
     print(f"Written stations.json ({len(stations)} stations)")
+
+    print("Building line definitions...")
+    lines = build_lines(stations)
+    (DOCS_DIR / "lines.json").write_text(json.dumps(lines, separators = (",", ":")))
+    print(f"Written lines.json ({len(lines)} lines)")
 
     print("Processing OD matrix (this takes ~30s)...")
     od = build_od_data(odm_path)

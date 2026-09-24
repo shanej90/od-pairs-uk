@@ -27,6 +27,15 @@ let circleDisplayLimit = 15; // how many "both" routes to draw, busiest first; I
 let circleStats = null;     // { stations: [tlc,...], startJourneys, bothJourneys, bothEdges: [[o,d,journeys],...] }
 let circleComputeToken = 0; // guards a stale async recompute against a newer one superseding it
 
+// --- polygon mode: draw an arbitrary shape to analyse journeys within it ---
+let polygonShapeLayer, polygonOdLayer; // the polygon (or in-progress preview), and its drawn OD lines
+let polygon = null;             // L.Polygon, or null when no polygon is active
+let placingPolygon = false;     // true while the user is clicking out vertices
+let polygonPoints = [];         // L.LatLng[] placed so far, before the shape is finished
+let polygonDisplayLimit = 15;   // how many "both" routes to draw, busiest first; Infinity = all
+let polygonStats = null;        // { stations: [tlc,...], startJourneys, bothJourneys, bothEdges: [[o,d,journeys],...] }
+let polygonComputeToken = 0;    // guards a stale async recompute against a newer one superseding it
+
 const STATION_STYLE = { radius: 3, fillColor: '#607d8b', color: '#37474f', weight: 0.5, fillOpacity: 0.8 };
 const ORIGIN_STYLE  = { radius: 8, fillColor: '#fdd835', color: '#fff', weight: 1.5, fillOpacity: 1 };
 const LINE_STATION_STYLE = { radius: 4, fillColor: '#66bb6a', color: '#2e7d32', weight: 1, fillOpacity: 0.9 };
@@ -81,6 +90,8 @@ function initMap() {
     odLayer = L.layerGroup().addTo(map);
     circleOdLayer = L.layerGroup().addTo(map);
     circleShapeLayer = L.layerGroup().addTo(map);
+    polygonOdLayer = L.layerGroup().addTo(map);
+    polygonShapeLayer = L.layerGroup().addTo(map);
     lineShapeLayer = L.layerGroup().addTo(map);
     lineOdLayer = L.layerGroup().addTo(map);
 
@@ -127,8 +138,9 @@ function initSearch() {
 
 // --- select origin station and load its OD data ---
 async function selectOrigin(tlc) {
-    if (!stations[tlc] || placingCircle) return; // mid-pick for a circle owns the next map click
+    if (!stations[tlc] || placingCircle || placingPolygon) return; // mid-pick for a shape owns the next map click
     if (circle) clearCircle();
+    if (polygon) clearPolygon();
     if (selectedLine) clearLine();
 
     if (selectedOrigin && stationMarkers[selectedOrigin]) {
@@ -169,7 +181,7 @@ function getVisiblePairs() {
 
 // --- draw OD lines ---
 function renderOD() {
-    if (circle) return; // circle mode owns the map view while active
+    if (circle || polygon) return; // circle/polygon mode owns the map view while active
     odLayer.clearLayers();
     if (!selectedOrigin) return;
 
@@ -236,6 +248,8 @@ function toggleDrawCircle() {
 // --- waits for one map click to set the circle's centre (a fresh circle, or moving an existing one) ---
 function enterPlacingMode() {
     if (placingCircle) return; // already waiting on a click; don't stack a second listener
+    if (placingPolygon) cancelPlacingPolygon();
+    if (polygon) clearPolygon();
     if (selectedLine) clearLine();
     placingCircle = true;
     map.getContainer().style.cursor = 'crosshair';
@@ -284,7 +298,9 @@ function onMapPickCenter(e) {
 }
 
 document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') cancelPlacing();
+    if (e.key !== 'Escape') return;
+    cancelPlacing();
+    cancelPlacingPolygon();
 });
 
 // --- removes the circle entirely and restores station-search mode ---
@@ -400,7 +416,7 @@ function updateCircleTooltip() {
         + `${startJourneys.toLocaleString()} journeys start here<br>`
         + `${bothJourneys.toLocaleString()} stay within the circle`;
     circle.unbindTooltip();
-    circle.bindTooltip(html, { permanent: true, direction: 'center', className: 'circle-tooltip' });
+    circle.bindTooltip(html, { permanent: true, direction: 'center', className: 'shape-tooltip' });
 }
 
 function setCirclePanelLoading() {
@@ -529,6 +545,319 @@ function onRadiusInput(e) {
 }
 
 // =====================================================================
+// Polygon mode — draw an arbitrary shape (not just a circle) and analyse
+// the journeys within it, the same way circle mode does.
+// =====================================================================
+
+// --- standard ray-casting point-in-polygon test; lat/lng treated as a flat plane, fine at UK scale ---
+function pointInPolygon(latlng, vertices) {
+    const x = latlng.lng, y = latlng.lat;
+    let inside = false;
+    for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+        const xi = vertices[i].lng, yi = vertices[i].lat;
+        const xj = vertices[j].lng, yj = vertices[j].lat;
+        const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+// --- "Draw polygon" button: starts placing a new polygon, or cancels if already placing ---
+function toggleDrawPolygon() {
+    if (placingPolygon) { cancelPlacingPolygon(); return; }
+    enterPlacingPolygonMode();
+}
+
+// --- waits for map clicks to place vertices; a polygon is always redrawn from scratch, no "move" ---
+function enterPlacingPolygonMode() {
+    if (placingPolygon) return; // already placing; don't stack listeners
+    if (placingCircle) cancelPlacing();
+    if (circle) clearCircle();
+    if (selectedLine) clearLine();
+    if (polygon) clearPolygon();
+
+    placingPolygon = true;
+    polygonPoints = [];
+    map.doubleClickZoom.disable(); // a finishing double-click shouldn't also zoom the map
+    map.getContainer().style.cursor = 'crosshair';
+    map.on('click', onMapAddPolygonPoint);
+    map.on('dblclick', onMapFinishPolygon);
+
+    deactivateOriginSelection('Polygon mode active');
+    document.getElementById('polygon-btn').textContent = 'Click the map…';
+    document.getElementById('polygon-btn').classList.add('picking');
+    renderPolygonPlacingPanel();
+}
+
+// --- Escape, or re-clicking "Draw polygon", backs out of placing mode without side effects ---
+function cancelPlacingPolygon() {
+    if (!placingPolygon) return;
+    placingPolygon = false;
+    map.getContainer().style.cursor = '';
+    map.doubleClickZoom.enable();
+    map.off('click', onMapAddPolygonPoint);
+    map.off('dblclick', onMapFinishPolygon);
+    polygonPoints = [];
+    polygonShapeLayer.clearLayers();
+
+    document.getElementById('polygon-btn').textContent = 'Draw polygon';
+    document.getElementById('polygon-btn').classList.remove('picking');
+    reactivateOriginSelection();
+}
+
+function onMapAddPolygonPoint(e) {
+    polygonPoints.push(e.latlng);
+    renderPolygonPreview();
+    renderPolygonPlacingPanel();
+}
+
+// --- a double-click's own two "click" events already added two near-duplicate points; drop the second ---
+function onMapFinishPolygon() {
+    if (polygonPoints.length >= 4) polygonPoints.pop();
+    if (polygonPoints.length < 3) { renderPolygonPreview(); renderPolygonPlacingPanel(); return; }
+    finishPolygon();
+}
+
+// --- draws the vertices placed so far, plus the edges joining them, while still placing ---
+function renderPolygonPreview() {
+    polygonShapeLayer.clearLayers();
+    for (const pt of polygonPoints) {
+        L.circleMarker(pt, { radius: 4, color: '#ab47bc', weight: 1.5, fillColor: '#ab47bc', fillOpacity: 0.9 }).addTo(polygonShapeLayer);
+    }
+    if (polygonPoints.length > 1) {
+        L.polyline(polygonPoints, { color: '#ab47bc', weight: 2, dashArray: '4,4' }).addTo(polygonShapeLayer);
+    }
+}
+
+// --- placing-mode panel: point count, and Finish/Cancel controls ---
+function renderPolygonPlacingPanel() {
+    const n = polygonPoints.length;
+    document.getElementById('panel-body').innerHTML = `
+      <p class="text-muted small text-center py-2">
+        Click the map to add points (${n} placed).${n >= 3 ? ' Double-click, or Finish, to close the shape.' : ' At least 3 needed.'}
+      </p>
+      <div class="d-flex gap-1">
+        <button class="btn btn-sm btn-info flex-fill" ${n < 3 ? 'disabled' : ''} onclick="finishPolygon()">Finish polygon</button>
+        <button class="btn btn-sm btn-outline-danger flex-fill" onclick="cancelPlacingPolygon()">Cancel</button>
+      </div>
+    `;
+}
+
+// --- closes the shape and switches from placing mode to an active polygon ---
+function finishPolygon() {
+    if (polygonPoints.length < 3) return;
+    placingPolygon = false;
+    map.getContainer().style.cursor = '';
+    map.doubleClickZoom.enable();
+    map.off('click', onMapAddPolygonPoint);
+    map.off('dblclick', onMapFinishPolygon);
+
+    polygonShapeLayer.clearLayers();
+    polygon = L.polygon(polygonPoints, { color: '#ab47bc', weight: 2, fillOpacity: 0.08 }).addTo(polygonShapeLayer);
+    polygonPoints = [];
+
+    document.getElementById('polygon-btn').style.display = 'none';
+    document.getElementById('polygon-btn').classList.remove('picking');
+    document.getElementById('legend').style.display = '';
+
+    recomputePolygon();
+}
+
+// --- removes the polygon entirely and restores station-search mode ---
+function clearPolygon() {
+    if (!polygon) return;
+    polygonShapeLayer.clearLayers();
+    polygonOdLayer.clearLayers();
+    polygon = null;
+    polygonStats = null;
+    polygonDisplayLimit = 15;
+    polygonComputeToken++; // invalidate any in-flight recompute
+
+    document.getElementById('polygon-btn').style.display = '';
+    document.getElementById('polygon-btn').textContent = 'Draw polygon';
+    document.getElementById('polygon-btn').classList.remove('picking');
+    document.getElementById('legend').style.display = 'none';
+
+    reactivateOriginSelection();
+}
+
+// --- sums journeys starting in the polygon, and those staying entirely within it ---
+async function recomputePolygon() {
+    if (!polygon) return;
+    const token = ++polygonComputeToken;
+
+    polygonOdLayer.clearLayers();
+    setPolygonPanelLoading();
+
+    const vertices = polygon.getLatLngs()[0]; // outer ring
+    const inPolygon = Object.keys(stations).filter(
+        tlc => pointInPolygon(L.latLng(stations[tlc].la, stations[tlc].lo), vertices)
+    );
+    const inSet = new Set(inPolygon);
+
+    const outboundLists = await Promise.all(inPolygon.map(fetchOutbound));
+    if (token !== polygonComputeToken) return; // a newer recompute superseded this one
+
+    let startJourneys = 0; // every journey starting at a station in the polygon, to any destination
+    let bothJourneys = 0;  // journeys where both origin and destination are in the polygon
+    const bothEdges = [];  // [[origin, dest, journeys], ...], for drawing
+
+    inPolygon.forEach((tlc, i) => {
+        for (const [dest, journeys] of outboundLists[i]) {
+            startJourneys += journeys;
+            if (inSet.has(dest)) {
+                bothJourneys += journeys;
+                bothEdges.push([tlc, dest, journeys]);
+            }
+        }
+    });
+    bothEdges.sort((a, b) => b[2] - a[2]); // busiest first, so "top N" and the colour ramp both make sense
+
+    polygonStats = { stations: inPolygon, startJourneys, bothJourneys, bothEdges };
+    renderPolygonOD();
+    renderPolygonPanel();
+    updatePolygonTooltip();
+}
+
+// --- the "both" edges currently on screen, limited by polygonDisplayLimit ---
+function getVisiblePolygonEdges() {
+    if (!polygonStats) return [];
+    const { bothEdges } = polygonStats;
+    return polygonDisplayLimit === Infinity ? bothEdges : bothEdges.slice(0, polygonDisplayLimit);
+}
+
+// --- draws only the journeys that stay entirely within the polygon, capped to the display limit ---
+function renderPolygonOD() {
+    polygonOdLayer.clearLayers();
+    if (!polygonStats) return;
+
+    const { bothEdges } = polygonStats;
+    const logMax = bothEdges.length ? Math.log10(bothEdges[0][2] + 1) : 1; // scale is fixed to the busiest route, regardless of how many are shown
+
+    for (const [o, d, journeys] of getVisiblePolygonEdges()) {
+        const os = stations[o], ds = stations[d];
+        if (!os || !ds) continue;
+
+        const ratio = logRatio(journeys, logMax);
+        const line = L.polyline([[os.la, os.lo], [ds.la, ds.lo]], {
+            color: journeyColor(ratio),
+            weight: 0.5 + ratio * 4,
+            opacity: 0.2 + ratio * 0.7,
+        });
+        line.bindTooltip(`<strong>${os.n} → ${ds.n}</strong><br>${journeys.toLocaleString()} journeys`, { sticky: true });
+        line.on('mouseover', function () { this.setStyle({ weight: this.options.weight + 1.5 }); });
+        line.on('mouseout',  function () { this.setStyle({ weight: this.options.weight - 1.5 }); });
+        line.addTo(polygonOdLayer);
+    }
+}
+
+// --- permanent label on the polygon itself, giving an at-a-glance summary ---
+function updatePolygonTooltip() {
+    if (!polygon || !polygonStats) return;
+    const { stations: sList, startJourneys, bothJourneys } = polygonStats;
+    const html = `<strong>${sList.length.toLocaleString()}</strong> station${sList.length === 1 ? '' : 's'}<br>`
+        + `${startJourneys.toLocaleString()} journeys start here<br>`
+        + `${bothJourneys.toLocaleString()} stay within the polygon`;
+    polygon.unbindTooltip();
+    polygon.bindTooltip(html, { permanent: true, direction: 'center', className: 'shape-tooltip' });
+}
+
+function setPolygonPanelLoading() {
+    document.getElementById('panel-body').innerHTML = '<p class="text-muted small text-center py-2">Computing journeys in polygon…</p>';
+}
+
+// --- detailed stats panel for polygon mode ---
+function renderPolygonPanel() {
+    if (!polygonStats) return;
+
+    const { stations: sList, startJourneys, bothJourneys, bothEdges } = polygonStats;
+    const visible = getVisiblePolygonEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const sliderVal = polygonDisplayLimit === Infinity ? bothEdges.length : Math.min(polygonDisplayLimit, bothEdges.length);
+    const limitLabel = polygonDisplayLimit === Infinity ? `All (${bothEdges.length.toLocaleString()})` : sliderVal.toLocaleString();
+
+    document.getElementById('panel-body').innerHTML = `
+      <div class="origin-name">Polygon analysis</div>
+      <div class="mb-3">
+        <div class="stat-row">
+          <span class="stat-label">Stations in polygon</span>
+          <span class="stat-value" id="polygon-station-count">${sList.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys starting in polygon</span>
+          <span class="stat-value" id="polygon-start-journeys">${startJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Start &amp; end in polygon (all routes)</span>
+          <span class="stat-value" id="polygon-both-journeys">${bothJourneys.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Routes shown</span>
+          <span class="stat-value" id="polygon-routes-shown">${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Journeys shown</span>
+          <span class="stat-value" id="polygon-journeys-shown">${visibleJourneys.toLocaleString()}</span>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <div class="d-flex justify-content-between text-muted mb-1" style="font-size:0.7rem">
+          <label for="polygon-limit-slider" class="mb-0">Routes shown (busiest first)</label>
+          <span id="polygon-limit-label" class="text-info fw-semibold">${limitLabel}</span>
+        </div>
+        <div class="d-flex gap-1 mb-2">
+          <button class="${polygonDisplayLimit === 15 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setPolygonLimit(15)">Top 15</button>
+          <button class="${polygonDisplayLimit === 50 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setPolygonLimit(50)">Top 50</button>
+          <button class="${polygonDisplayLimit === 100 ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setPolygonLimit(100)">Top 100</button>
+          <button class="${polygonDisplayLimit === Infinity ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'} flex-fill" onclick="setPolygonLimit(Infinity)">All</button>
+        </div>
+        <input id="polygon-limit-slider" type="range" class="form-range" min="1" max="${Math.max(bothEdges.length, 1)}" value="${sliderVal}" />
+      </div>
+
+      <div class="d-flex gap-1">
+        <button id="polygon-redraw-btn" class="btn btn-sm btn-outline-info flex-fill" onclick="enterPlacingPolygonMode()">Redraw</button>
+        <button class="btn btn-sm btn-outline-danger px-2" onclick="clearPolygon()" title="Clear polygon">✕</button>
+      </div>
+    `;
+    document.getElementById('polygon-limit-slider').addEventListener('input', onPolygonLimitSlider);
+}
+
+// --- lightweight stat refresh that doesn't touch the whole panel ---
+function refreshPolygonStats() {
+    if (!polygonStats) return;
+    const { bothEdges } = polygonStats;
+    const visible = getVisiblePolygonEdges();
+    const visibleJourneys = visible.reduce((sum, [, , j]) => sum + j, 0);
+
+    const shownRoutesEl = document.getElementById('polygon-routes-shown');
+    const shownJourneysEl = document.getElementById('polygon-journeys-shown');
+    if (shownRoutesEl) shownRoutesEl.textContent = `${visible.length.toLocaleString()} / ${bothEdges.length.toLocaleString()}`;
+    if (shownJourneysEl) shownJourneysEl.textContent = visibleJourneys.toLocaleString();
+}
+
+// --- set the "both" routes display limit via button ---
+function setPolygonLimit(n) {
+    if (!polygonStats) return;
+    polygonDisplayLimit = n;
+    renderPolygonOD();
+    renderPolygonPanel();
+}
+
+// --- slider drives the same display limit ---
+function onPolygonLimitSlider(e) {
+    if (!polygonStats) return;
+    const val = parseInt(e.target.value, 10);
+    const atMax = val >= polygonStats.bothEdges.length;
+    polygonDisplayLimit = atMax ? Infinity : val;
+    const label = document.getElementById('polygon-limit-label');
+    if (label) label.textContent = atMax ? `All (${polygonStats.bothEdges.length.toLocaleString()})` : val.toLocaleString();
+    renderPolygonOD();
+    refreshPolygonStats();
+}
+
+// =====================================================================
 // Line mode — pick a named line to see journey stats for its stations,
 // independent of whichever origin station or circle was active.
 // =====================================================================
@@ -568,8 +897,9 @@ function initLineSearch() {
 
 // --- select a named line and load journey stats for its stations ---
 async function selectLine(name) {
-    if (!lines[name] || placingCircle) return;
+    if (!lines[name] || placingCircle || placingPolygon) return;
     if (circle) clearCircle();
+    if (polygon) clearPolygon();
 
     deactivateOriginSelection('Line mode active');
     selectedLine = name;
@@ -780,7 +1110,7 @@ function setPanelError() {
 
 // --- full panel render ---
 function renderPanel() {
-    if (circle) return; // circle mode owns the panel while active
+    if (circle || polygon) return; // circle/polygon mode owns the panel while active
     const s = stations[selectedOrigin];
     const totalDests = currentPairs.length;
     const totalJourneys = currentPairs.reduce((sum, [, j]) => sum + j, 0);

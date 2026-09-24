@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4 - 2026-09-24
+
+- Added polygon mode: click out an arbitrary shape (3+ points, closed with a double-click or the Finish button) to find every station inside it, alongside the existing circle.
+- Polygon mode reuses the circle's stats, on-shape tooltip, and busiest-15/50/100/all control, and hands off to/from station search, area mode, and line mode the same way they already hand off to each other.
+
 ## v0.3 - 2026-09-12
 
 - Added line mode: search for a named line (eg, "West Coast Main Line") to highlight its stations and draw the route.

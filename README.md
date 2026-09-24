@@ -1,10 +1,10 @@
 # UK Rail O/D Explorer
 
-**v0.3** - see [CHANGELOG.md](CHANGELOG.md) for release history.
+**v0.4** - see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ORR publishes origin-destination ticket estimates for UK rail as a raw CSV - 1.6 million-odd station-pair rows, readable only as a spreadsheet. This turns it into a map. Pick a station, or let the default (London King's Cross) load: it draws a line to every station it sells tickets to, sized and coloured by journey volume. Filter down to the busiest 15, 50, or 100 destinations, show everything at once, or narrow to a single destination to see the count in both directions.
 
-Draw a circle on the map to switch to area mode: click a point, set its radius in km, and it finds every station inside. It totals journeys starting there against journeys that both start and end there. It also draws the busiest of those fully-contained routes - choosing 15, 50, 100, or all, the same as the station view - so dense areas stay readable. `Move centre` repositions the circle without redrawing it.
+Draw a circle, or an arbitrary polygon, on the map to switch to area mode: for a circle, click a point and set its radius in km; for a polygon, click out points and close the shape with a double-click or the Finish button. Either way it finds every station inside, totals journeys starting there against journeys that both start and end there, and draws the busiest of those fully-contained routes - choosing 15, 50, 100, or all, the same as the station view - so dense areas stay readable. `Move centre` repositions a circle without redrawing it; a polygon is redrawn from scratch instead.
 
 Or search for a named line - "West Coast Main Line", "Elizabeth Line (Reading-Shenfield)", and around 60 others - to switch to line mode. It highlights the line's stations, draws the route, and totals journeys starting anywhere on the line against journeys that both start and end on it. The busiest of those routes get drawn, with the same 15/50/100/all control as the other two modes. Line coverage is hand-curated, not official - see Data sources below for what that means for accuracy.
 
@@ -55,7 +55,7 @@ Do this to bring in a new year's figures, or after fixing something in a source 
 ## Future developments
 
 - Only one ODM year loads at a time. Rebuilding for a new year overwrites the last one's output entirely, so comparing two years means re-running the build against an older CSV and diffing the JSON yourself.
-- Area mode fetches one file per station inside the circle. Fine for a city-sized circle (a few hundred stations) - a circle spanning most of the network means a few thousand individual fetches, with no warning or cap on that yet.
+- Area mode fetches one file per station inside the shape. Fine for a city-sized circle or polygon (a few hundred stations) - a shape spanning most of the network means a few thousand individual fetches, with no warning or cap on that yet.
 - The layout assumes a desktop-sized window. The 300px side panel hasn't been adapted for a phone screen.
 - Line mode covers around 60 named lines, not every branch and loop on the network. A station not on a covered line just won't come up in a line search - there's no "nearest line" fallback.
 
